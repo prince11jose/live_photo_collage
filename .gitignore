@@ -500,3 +500,8 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Secrets
+
+backend/client_secrets.json
+backend/token.json
