@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Photo Collage Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .image-container { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }
+        .image-item { border: 2px solid #ddd; padding: 5px; }
+        .debug { background: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Photo Collage Debug Test</h1>
+    
+    <div class="debug">
+        <h3>API Response:</h3>
+        <pre id="apiResponse">Loading...</pre>
+    </div>
+    
+    <div class="debug">
+        <h3>Image URLs:</h3>
+        <div id="urlList">Loading...</div>
+    </div>
+    
+    <div class="debug">
+        <h3>Images:</h3>
+        <div id="images" class="image-container">Loading...</div>
+    </div>
+    
+    <div id="status">Starting...</div>
+
+    <script>
+        const log = (message, type = 'info') => {
+            console.log(message);
+            const statusEl = document.getElementById('status');
+            statusEl.innerHTML += `<div class="${type}">${message}</div>`;
+        };
+
+        async function loadImages() {
+            try {
+                log('Fetching images from API...', 'info');
+                
+                const response = await fetch('http://localhost:5000/api/images', {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json',
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const images = await response.json();
+                log(`API returned ${images.length} images`, 'success');
+                
+                // Show raw API response
+                document.getElementById('apiResponse').textContent = JSON.stringify(images, null, 2);
+                
+                // Show processed URLs
+                const urlListEl = document.getElementById('urlList');
+                urlListEl.innerHTML = '';
+                
+                const container = document.getElementById('images');
+                container.innerHTML = '';
+                
+                if (images.length === 0) {
+                    container.innerHTML = '<p>No images found</p>';
+                    return;
+                }
+                
+                images.forEach((url, index) => {
+                    // Use the URL directly (now it's a Google Drive URL)
+                    const fullUrl = url;
+                    log(`Processing image ${index + 1}: ${fullUrl}`, 'info');
+                    
+                    // Add to URL list
+                    const urlDiv = document.createElement('div');
+                    urlDiv.innerHTML = `<strong>Image ${index + 1}:</strong> <a href="${fullUrl}" target="_blank">${fullUrl}</a>`;
+                    urlListEl.appendChild(urlDiv);
+                    
+                    // Create image element
+                    const imgContainer = document.createElement('div');
+                    imgContainer.className = 'image-item';
+                    
+                    const img = document.createElement('img');
+                    img.src = fullUrl;
+                    img.alt = `Image ${index + 1}`;
+                    img.style.width = '200px';
+                    img.style.height = '200px';
+                    img.style.objectFit = 'cover';
+                    img.style.display = 'block';
+                    
+                    const caption = document.createElement('p');
+                    caption.textContent = `Image ${index + 1}`;
+                    caption.style.margin = '5px 0';
+                    caption.style.fontSize = '12px';
+                    
+                    img.onload = () => {
+                        log(`✅ Image ${index + 1} loaded successfully`, 'success');
+                        caption.textContent += ' ✅ Loaded';
+                    };
+                    
+                    img.onerror = (error) => {
+                        log(`❌ Failed to load image ${index + 1}: ${fullUrl}`, 'error');
+                        caption.textContent += ' ❌ Failed';
+                        img.style.background = '#ffcccc';
+                        img.alt = 'Failed to load';
+                    };
+                    
+                    imgContainer.appendChild(img);
+                    imgContainer.appendChild(caption);
+                    container.appendChild(imgContainer);
+                });
+                
+            } catch (error) {
+                log(`❌ Error loading images: ${error.message}`, 'error');
+                document.getElementById('apiResponse').textContent = `Error: ${error.message}`;
+                document.getElementById('images').innerHTML = '<p class="error">Failed to load images</p>';
+            }
+        }
+        
+        // Start loading
+        loadImages();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadImages, 30000);
+    </script>
+</body>
+</html>
