@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 # Global variable for image URLs and last activity timestamp
 image_urls = []
 last_activity_timestamp = None
+image_cache = {
+    'data': [],
+    'timestamp': None,
+    'ttl': 60  # Cache for 60 seconds
+}
 
 # Configuration
 UPLOAD_FOLDER_ID = os.getenv('UPLOAD_FOLDER_ID', '1XnWtpAjglmjA-99zs-ao___16wf7MbKZ')
@@ -108,7 +113,7 @@ def make_file_public(file_id):
         return False
 
 def list_images_from_drive(folder_id=None):
-    """Fetch images from a specific folder in Google Drive and ensure they are publicly accessible."""
+    """Fetch images from a specific folder in Google Drive."""
     drive_service = get_drive_service()
     
     # If folder_id is provided, query for images in that folder
@@ -123,11 +128,7 @@ def list_images_from_drive(folder_id=None):
     
     items = results.get('files', [])
     
-    # Ensure all images are publicly accessible
-    for file in items:
-        make_file_public(file['id'])
-    
-    # Return direct Google Drive URLs
+    # Return direct Google Drive URLs (don't set permissions here to avoid delays)
     return [{"id": file['id'], "url": f"https://drive.google.com/uc?export=view&id={file['id']}"} for file in items]
 
 
@@ -293,6 +294,11 @@ def upload_photo():
             new_image_url = f"https://drive.google.com/uc?export=view&id={file_id}"
             image_urls.append(new_image_url)
             
+            # Clear cache to force refresh
+            global image_cache
+            image_cache['timestamp'] = None
+            image_cache['data'] = []
+            
             # Notify all clients of the new image
             socketio.emit('new_images', [new_image_url])
             
@@ -315,6 +321,22 @@ def upload_photo():
 def test_page():
     """Serve test page for debugging image display."""
     with open('test.html', 'r') as f:
+        html_content = f.read()
+    return html_content
+
+# Debug page for image loading
+@app.route('/debug-images.html')
+def debug_images_page():
+    """Serve debug page for testing image loading."""
+    with open('debug-images.html', 'r') as f:
+        html_content = f.read()
+    return html_content
+
+# Frontend debug page
+@app.route('/frontend-debug.html')
+def frontend_debug_page():
+    """Serve comprehensive frontend debug page."""
+    with open('frontend-debug.html', 'r') as f:
         html_content = f.read()
     return html_content
 
@@ -659,6 +681,16 @@ def health_check():
             "timestamp": datetime.datetime.utcnow().isoformat()
         }), 500
 
+# Configuration endpoint
+@app.route('/api/config', methods=['GET'])
+def get_config():
+    """Get application configuration."""
+    return jsonify({
+        "title": os.getenv('COLLAGE_TITLE', 'Live Photo Collage'),
+        "version": "1.0.0",
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    })
+
 # Authentication endpoint
 @app.route('/api/auth', methods=['POST'])
 def authenticate():
@@ -685,9 +717,47 @@ def authenticate():
 # Serve image URLs
 @app.route('/api/images', methods=['GET'])
 def get_images():
-    """API to fetch current image URLs."""
-    logger.debug(f"Fetching current image URLs {image_urls}")
-    return jsonify(image_urls)
+    """API to fetch current image URLs from Google Drive with caching."""
+    global image_cache
+    
+    try:
+        # Check if cache is still valid
+        current_time = datetime.datetime.now()
+        if (image_cache['timestamp'] and 
+            (current_time - image_cache['timestamp']).seconds < image_cache['ttl'] and 
+            image_cache['data']):
+            logger.debug(f"Serving cached image URLs: {len(image_cache['data'])} images")
+            return jsonify(image_cache['data'])
+        
+        # Get the current upload folder
+        folder_id = create_or_get_upload_folder()
+        
+        # Fetch images directly from Google Drive
+        images = list_images_from_drive(folder_id=folder_id)
+        
+        # Extract URLs from the image objects
+        image_urls_current = [img['url'] for img in images]
+        
+        # Update cache
+        image_cache['data'] = image_urls_current
+        image_cache['timestamp'] = current_time
+        
+        # Update the global state for WebSocket notifications
+        global image_urls
+        image_urls = image_urls_current
+        
+        logger.debug(f"Fetching fresh image URLs: {len(image_urls_current)} images")
+        return jsonify(image_urls_current)
+        
+    except Exception as e:
+        logger.error(f"Error fetching images: {str(e)}")
+        # Fallback to cached data if available
+        if image_cache['data']:
+            logger.debug(f"Falling back to cached image URLs: {len(image_cache['data'])} images")
+            return jsonify(image_cache['data'])
+        # Final fallback to global state
+        logger.debug(f"Falling back to global image URLs: {len(image_urls)} images")
+        return jsonify(image_urls)
 
 # Proxy for serving Google Drive images
 @app.route('/proxy/image/<image_id>', methods=['GET'])
@@ -747,9 +817,13 @@ def extract_image_urls_from_activities(activities):
 @app.route('/api/refresh-images', methods=['POST'])
 def refresh_images():
     """API to refresh image list from Google Drive based on Drive activity and notify clients."""
-    global image_urls, last_activity_timestamp
+    global image_urls, last_activity_timestamp, image_cache
 
     try:
+        # Clear cache to force fresh data
+        image_cache['timestamp'] = None
+        image_cache['data'] = []
+        
         # Fetch activities since the last activity timestamp
         folder_id = request.json.get('folder_id') if request.json else UPLOAD_FOLDER_ID
         activities = get_drive_activity(last_activity_timestamp, folder_id)
@@ -779,6 +853,16 @@ def refresh_images():
     except Exception as e:
         logger.error(f"Error refreshing images: {str(e)}")
         return jsonify({"error": "Failed to refresh images"}), 500
+
+# Clear cache endpoint
+@app.route('/api/clear-cache', methods=['POST'])
+def clear_cache():
+    """Clear the image cache to force fresh data on next request."""
+    global image_cache
+    image_cache['timestamp'] = None
+    image_cache['data'] = []
+    logger.info("Image cache cleared")
+    return jsonify({"status": "Cache cleared successfully"})
 
 if __name__ == '__main__':
     # Try to preload images on startup, but don't fail if authentication isn't ready
