@@ -30,8 +30,14 @@ ORIGINALS_DIR = os.getenv('ORIGINALS_DIR') or os.path.join(os.path.dirname(PHOTO
 FLASK_HOST = os.getenv('FLASK_HOST', '0.0.0.0')
 FLASK_PORT = int(os.getenv('FLASK_PORT', 5000))
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+# Guests upload with no login. Cap the board at this many photos until someone has signed in
+# with Google at least once (see any_admin_signed_in) - then the cap is lifted for good.
+UPLOAD_LIMIT_UNSIGNED = int(os.getenv('UPLOAD_LIMIT_UNSIGNED', 15))
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
 DB_PATH = os.getenv('DB_PATH') or os.path.join(os.path.dirname(PHOTOS_DIR), 'app.db')
+# Emails allowed to view the user list (which exposes everyone's email/phone). Everyone who
+# signs in can still download/clear photos - this allow-list only gates the user-directory view.
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv('ADMIN_EMAILS', '').split(',') if e.strip()}
 # Long-edge cap for the board's display copy - plenty sharp on a large screen, far lighter to load
 DISPLAY_MAX_DIM = int(os.getenv('DISPLAY_MAX_DIM', 1600))
 SAVE_FORMATS = {'.jpg': 'JPEG', '.jpeg': 'JPEG', '.png': 'PNG', '.gif': 'GIF', '.webp': 'WEBP'}
@@ -85,6 +91,18 @@ def verify_google_token(token):
     except ValueError as e:
         logger.warning(f"Google token rejected: {e}")
         return None
+
+
+def is_admin(payload):
+    return bool(payload) and payload.get('email', '').lower() in ADMIN_EMAILS
+
+
+def any_admin_signed_in():
+    """True once at least one person has ever signed in with Google on this board."""
+    conn = get_db()
+    count = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    conn.close()
+    return count > 0
 
 
 def today_folder():
@@ -163,6 +181,12 @@ def upload_photo():
         file = request.files['photo']
         if file.filename == '':
             return jsonify({"error": "No file selected"}), 400
+
+        if len(known_urls) >= UPLOAD_LIMIT_UNSIGNED and not any_admin_signed_in():
+            return jsonify({
+                "error": f"Upload limit reached ({UPLOAD_LIMIT_UNSIGNED} photos). "
+                         "Ask the host to sign in with Google on the display screen to allow more uploads."
+            }), 403
 
         ext = os.path.splitext(file.filename)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
@@ -600,7 +624,7 @@ def upsert_profile():
     row = conn.execute('SELECT * FROM users WHERE google_sub = ?', (sub,)).fetchone()
     conn.close()
 
-    return jsonify(user_to_dict(row))
+    return jsonify({**user_to_dict(row), "isAdmin": is_admin(payload)})
 
 
 # Update the signed-in user's phone number
@@ -625,16 +649,18 @@ def update_profile():
     row = conn.execute('SELECT * FROM users WHERE google_sub = ?', (sub,)).fetchone()
     conn.close()
 
-    return jsonify(user_to_dict(row))
+    return jsonify({**user_to_dict(row), "isAdmin": is_admin(payload)})
 
 
-# List every user who has ever signed in, gated behind Google Sign-In
+# List every user who has ever signed in, restricted to ADMIN_EMAILS
 @app.route('/api/admin/users', methods=['GET'])
 def list_users():
-    """List all recorded user profiles. Requires a valid Google ID token."""
+    """List all recorded user profiles. Requires a valid Google ID token belonging to an admin."""
     payload = verify_google_token(bearer_token())
     if not payload:
         return jsonify({"error": "Sign in with Google to view users"}), 401
+    if not is_admin(payload):
+        return jsonify({"error": "You don't have access to the user list"}), 403
 
     conn = get_db()
     rows = conn.execute('SELECT * FROM users ORDER BY last_seen DESC').fetchall()

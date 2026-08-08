@@ -11,3 +11,7 @@ data:
   # Client IDs are public identifiers, not secrets - safe to hold in a ConfigMap.
   # Leave empty to keep Google Sign-In / photo downloads hidden until you set one.
   GOOGLE_CLIENT_ID: "520360783242-nhtep74ugo25vuaq69i2lktg06v2vi60.apps.googleusercontent.com"
+  # Comma-separated emails allowed to see the "Manage users" directory (everyone's email/phone)
+  ADMIN_EMAILS: "prince@movingwalls.com"
+  # Guest uploads (no login) are capped at this many photos until someone signs in with Google
+  UPLOAD_LIMIT_UNSIGNED: "15"

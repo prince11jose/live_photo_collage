@@ -7,7 +7,7 @@ A real-time event photo wall. A shared screen shows a QR code; guests scan it, s
 ### Backend (Flask, `backend/app.py`)
 - Flask + Socket.IO for real-time updates
 - Photos are stored on local disk, date-partitioned: `data/photos/YYYY-MM-DD/`
-- Upload endpoint for mobile photo submissions (auto-uploads on capture/select)
+- Upload endpoint for mobile photo submissions (auto-uploads on capture/select), capped at `UPLOAD_LIMIT_UNSIGNED` (default 15) photos until someone has signed in with Google at least once on this board
 - `/api/download-all` zips every photo, gated behind Google Sign-In (ID token verification)
 - `/api/profile` and `/api/admin/users` record signed-in users (email, name, picture, phone) in a SQLite database (`data/app.db`)
 
@@ -37,14 +37,14 @@ npm start                 # http://localhost:3000, proxies /api and /socket.io t
 ## API Endpoints
 
 - `GET /api/images` — current photo URLs
-- `POST /api/upload` — upload a photo (mobile)
+- `POST /api/upload` — upload a photo (mobile); returns 403 past `UPLOAD_LIMIT_UNSIGNED` photos until someone has signed in with Google
 - `GET /upload` — mobile upload page
 - `POST /api/refresh-images` — rescan storage for photos added outside the API
 - `GET /api/download-all` — zip of every photo (requires `Authorization: Bearer <Google ID token>`)
 - `DELETE /api/clear-photos` — delete every photo (requires `Authorization: Bearer <Google ID token>`)
 - `POST /api/profile` — upsert the signed-in user's profile from their Google token, returns the stored record
 - `PUT /api/profile` — update the signed-in user's phone number (JSON body: `{"phone": "..."}`)
-- `GET /api/admin/users` — list every recorded user profile (requires `Authorization: Bearer <Google ID token>`)
+- `GET /api/admin/users` — list every recorded user profile (requires `Authorization: Bearer <Google ID token>` belonging to an email in `ADMIN_EMAILS`, returns 403 otherwise)
 - `GET /api/health`, `GET /api/config`, `GET /api/folder-info`
 
 ## Google Sign-In (optional)
@@ -54,6 +54,7 @@ Sign-in is only shown once `GOOGLE_CLIENT_ID` is set. To enable it:
 1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **OAuth 2.0 Client ID** of type **Web application**.
 2. Add your site's origin (e.g. `https://photowall.princejose.dev`) as an **Authorized JavaScript origin**.
 3. Set `GOOGLE_CLIENT_ID` in `backend/.env` (local) or the `photowall-config` ConfigMap (k8s) to that Client ID.
+4. Set `ADMIN_EMAILS` (comma-separated) to the email address(es) that should see the "Manage users" directory — everyone else can still sign in, download the zip, and clear the board, but won't see other guests' emails/phone numbers.
 
 ## Deploying to Kubernetes
 

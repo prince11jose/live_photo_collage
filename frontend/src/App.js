@@ -114,17 +114,22 @@ function App() {
     setDownloadError(null);
 
     let phone = '';
+    let isAdmin = false;
     try {
       const res = await fetch('/api/profile', {
         method: 'POST',
         headers: { Authorization: `Bearer ${response.credential}` },
       });
-      if (res.ok) phone = (await res.json()).phone || '';
+      if (res.ok) {
+        const data = await res.json();
+        phone = data.phone || '';
+        isAdmin = !!data.isAdmin;
+      }
     } catch (err) {
       // profile recording is best-effort; sign-in still succeeds locally
     }
 
-    setUser({ name: profile.name, picture: profile.picture, email: profile.email, phone });
+    setUser({ name: profile.name, picture: profile.picture, email: profile.email, phone, isAdmin });
     setPhoneInput(phone);
   }, []);
 
@@ -500,9 +505,11 @@ function App() {
                   <button className="btn btn--danger" onClick={clearBoard} disabled={clearing || images.length === 0}>
                     {clearing ? 'Clearing…' : 'Clear board'}
                   </button>
-                  <button className="btn" onClick={toggleUsers}>
-                    {showUsers ? 'Hide users' : 'Manage users'}
-                  </button>
+                  {user.isAdmin && (
+                    <button className="btn" onClick={toggleUsers}>
+                      {showUsers ? 'Hide users' : 'Manage users'}
+                    </button>
+                  )}
                   <button className="btn btn--link" onClick={signOut}>Sign out</button>
                 </>
               ) : (
@@ -541,7 +548,7 @@ function App() {
             </div>
           )}
 
-          {user && showUsers && (
+          {user && user.isAdmin && showUsers && (
             <div className="users-panel">
               {usersLoading ? (
                 <p className="users-panel__status">Loading users…</p>
