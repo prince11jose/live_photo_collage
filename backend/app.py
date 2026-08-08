@@ -1,7 +1,7 @@
 import logging
 from flask import Flask, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, join_room, leave_room
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from PIL import Image, ImageOps
@@ -30,9 +30,6 @@ ORIGINALS_DIR = os.getenv('ORIGINALS_DIR') or os.path.join(os.path.dirname(PHOTO
 FLASK_HOST = os.getenv('FLASK_HOST', '0.0.0.0')
 FLASK_PORT = int(os.getenv('FLASK_PORT', 5000))
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
-# Guests upload with no login. Cap the board at this many photos until someone has signed in
-# with Google at least once (see any_admin_signed_in) - then the cap is lifted for good.
-UPLOAD_LIMIT_UNSIGNED = int(os.getenv('UPLOAD_LIMIT_UNSIGNED', 15))
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
 DB_PATH = os.getenv('DB_PATH') or os.path.join(os.path.dirname(PHOTOS_DIR), 'app.db')
 # Emails allowed to view the user list (which exposes everyone's email/phone). Everyone who
@@ -44,9 +41,6 @@ SAVE_FORMATS = {'.jpg': 'JPEG', '.jpeg': 'JPEG', '.png': 'PNG', '.gif': 'GIF', '
 
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 os.makedirs(ORIGINALS_DIR, exist_ok=True)
-
-# Tracks URLs already broadcast/served so /api/refresh-images can diff new arrivals
-known_urls = set()
 
 
 def get_db():
@@ -68,6 +62,16 @@ def init_db():
             last_seen TEXT NOT NULL
         )
     ''')
+    # Each board is owned by one Google user (board_id == their google_sub). A photo
+    # only appears to its owner - this is what keeps one user's photos private from another.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS photos (
+            url TEXT PRIMARY KEY,
+            board_id TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_photos_board ON photos(board_id)')
     conn.commit()
     conn.close()
 
@@ -97,12 +101,40 @@ def is_admin(payload):
     return bool(payload) and payload.get('email', '').lower() in ADMIN_EMAILS
 
 
-def any_admin_signed_in():
-    """True once at least one person has ever signed in with Google on this board."""
+def board_exists(board_id):
+    if not board_id:
+        return False
     conn = get_db()
-    count = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    row = conn.execute('SELECT 1 FROM users WHERE google_sub = ?', (board_id,)).fetchone()
     conn.close()
-    return count > 0
+    return row is not None
+
+
+def list_board_photos(board_id):
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT url FROM photos WHERE board_id = ? ORDER BY uploaded_at', (board_id,)
+    ).fetchall()
+    conn.close()
+    return [row['url'] for row in rows]
+
+
+def claim_orphan_photos(board_id):
+    """Attribute any photo found on disk but missing from the photos table to board_id.
+    Used to migrate pre-existing files (from before per-board ownership existed) to their
+    rightful owner the first time that owner (an admin) signs in.
+    """
+    conn = get_db()
+    known = {row['url'] for row in conn.execute('SELECT url FROM photos').fetchall()}
+    now = datetime.datetime.utcnow().isoformat()
+    orphans = [url for url in list_all_photos() if url not in known]
+    conn.executemany(
+        'INSERT OR IGNORE INTO photos (url, board_id, uploaded_at) VALUES (?, ?, ?)',
+        [(url, board_id, now) for url in orphans]
+    )
+    conn.commit()
+    conn.close()
+    return orphans
 
 
 def today_folder():
@@ -182,11 +214,11 @@ def upload_photo():
         if file.filename == '':
             return jsonify({"error": "No file selected"}), 400
 
-        if len(known_urls) >= UPLOAD_LIMIT_UNSIGNED and not any_admin_signed_in():
+        board_id = request.form.get('board', '')
+        if not board_exists(board_id):
             return jsonify({
-                "error": f"Upload limit reached ({UPLOAD_LIMIT_UNSIGNED} photos). "
-                         "Ask the host to sign in with Google on the display screen to allow more uploads."
-            }), 403
+                "error": "This upload link isn't tied to a board. Ask the host to re-share the QR code."
+            }), 400
 
         ext = os.path.splitext(file.filename)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
@@ -210,9 +242,16 @@ def upload_photo():
             f.write(display_bytes)
 
         new_image_url = f"/photos/{date_folder}/{filename}"
-        known_urls.add(new_image_url)
 
-        socketio.emit('new_images', [new_image_url])
+        conn = get_db()
+        conn.execute(
+            'INSERT INTO photos (url, board_id, uploaded_at) VALUES (?, ?, ?)',
+            (new_image_url, board_id, datetime.datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+
+        socketio.emit('new_images', [new_image_url], room=board_id)
 
         return jsonify({
             "status": "success",
@@ -368,6 +407,14 @@ def upload_page():
             const status = document.getElementById('status');
             const folderPath = document.getElementById('folderPath');
             let selectedFile = null;
+            const boardId = new URLSearchParams(window.location.search).get('board') || '';
+
+            if (!boardId) {
+                showStatus('This upload link is missing its board ID. Ask the host to re-share the QR code.', 'error');
+                uploadArea.style.pointerEvents = 'none';
+                uploadArea.style.opacity = '0.5';
+                captureBtn.disabled = true;
+            }
 
             // Load folder information
             async function loadFolderInfo() {
@@ -433,10 +480,15 @@ def upload_page():
             }
 
             async function uploadPhoto(file) {
+                if (!boardId) {
+                    showStatus('This upload link is missing its board ID. Ask the host to re-share the QR code.', 'error');
+                    return;
+                }
                 showStatus('Uploading photo...', 'success');
 
                 const formData = new FormData();
                 formData.append('photo', file);
+                formData.append('board', boardId);
 
                 try {
                     const response = await fetch('/api/upload', {
@@ -526,10 +578,16 @@ def get_config():
     })
 
 
-# Download every photo as a single zip, gated behind Google Sign-In
+def url_to_relpath(url):
+    """'/photos/2026-08-08/photo_x.jpg' -> ('2026-08-08', 'photo_x.jpg')"""
+    _, date_folder, filename = url.strip('/').split('/')
+    return date_folder, filename
+
+
+# Download the signed-in user's own photos as a single zip
 @app.route('/api/download-all', methods=['GET'])
 def download_all():
-    """Zip and return every photo on the board. Requires a valid Google ID token."""
+    """Zip and return the caller's own board's photos. Requires a valid Google ID token."""
     if not GOOGLE_CLIENT_ID:
         return jsonify({"error": "Google Sign-In is not configured on this server"}), 503
 
@@ -537,15 +595,14 @@ def download_all():
     if not payload:
         return jsonify({"error": "Sign in with Google to download photos"}), 401
 
+    board_id = payload['sub']
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for date_name in sorted(os.listdir(ORIGINALS_DIR)) if os.path.isdir(ORIGINALS_DIR) else []:
-            date_path = os.path.join(ORIGINALS_DIR, date_name)
-            if not os.path.isdir(date_path):
-                continue
-            for filename in os.listdir(date_path):
-                if os.path.splitext(filename)[1].lower() in ALLOWED_EXTENSIONS:
-                    zf.write(os.path.join(date_path, filename), arcname=f"{date_name}/{filename}")
+        for url in list_board_photos(board_id):
+            date_folder, filename = url_to_relpath(url)
+            file_path = os.path.join(ORIGINALS_DIR, date_folder, filename)
+            if os.path.isfile(file_path):
+                zf.write(file_path, arcname=f"{date_folder}/{filename}")
 
     buffer.seek(0)
     logger.info(f"Photo archive downloaded by {payload.get('email', 'unknown user')}")
@@ -560,7 +617,7 @@ def download_all():
 # Wipe every photo from the board, gated behind Google Sign-In
 @app.route('/api/clear-photos', methods=['DELETE'])
 def clear_photos():
-    """Delete every stored photo and tell connected clients to clear their board."""
+    """Delete the signed-in user's own photos and tell their board to clear."""
     if not GOOGLE_CLIENT_ID:
         return jsonify({"error": "Google Sign-In is not configured on this server"}), 503
 
@@ -568,25 +625,30 @@ def clear_photos():
     if not payload:
         return jsonify({"error": "Sign in with Google to clear the board"}), 401
 
-    removed = len(list_all_photos())
+    board_id = payload['sub']
+    urls = list_board_photos(board_id)
 
-    for directory in (PHOTOS_DIR, ORIGINALS_DIR):
-        if not os.path.isdir(directory):
-            continue
-        for date_name in os.listdir(directory):
-            date_path = os.path.join(directory, date_name)
-            if os.path.isdir(date_path):
-                shutil.rmtree(date_path)
+    for url in urls:
+        date_folder, filename = url_to_relpath(url)
+        for directory in (PHOTOS_DIR, ORIGINALS_DIR):
+            file_path = os.path.join(directory, date_folder, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
 
-    known_urls.clear()
-    socketio.emit('board_cleared')
-    logger.info(f"Board cleared ({removed} photos) by {payload.get('email', 'unknown user')}")
+    conn = get_db()
+    conn.execute('DELETE FROM photos WHERE board_id = ?', (board_id,))
+    conn.commit()
+    conn.close()
 
-    return jsonify({"status": "cleared", "removed": removed})
+    socketio.emit('board_cleared', room=board_id)
+    logger.info(f"Board cleared ({len(urls)} photos) by {payload.get('email', 'unknown user')}")
+
+    return jsonify({"status": "cleared", "removed": len(urls)})
 
 
 def user_to_dict(row):
     return {
+        "boardId": row["google_sub"],
         "email": row["email"],
         "name": row["name"],
         "picture": row["picture"],
@@ -623,6 +685,9 @@ def upsert_profile():
     conn.commit()
     row = conn.execute('SELECT * FROM users WHERE google_sub = ?', (sub,)).fetchone()
     conn.close()
+
+    if is_admin(payload):
+        claim_orphan_photos(sub)
 
     return jsonify({**user_to_dict(row), "isAdmin": is_admin(payload)})
 
@@ -669,40 +734,56 @@ def list_users():
     return jsonify([user_to_dict(row) for row in rows])
 
 
-# Serve image URLs
+# Serve the signed-in user's own photo URLs
 @app.route('/api/images', methods=['GET'])
 def get_images():
-    """API to fetch current image URLs from local storage."""
+    """Return the caller's own board's photos. Requires a valid Google ID token."""
+    payload = verify_google_token(bearer_token())
+    if not payload:
+        return jsonify({"error": "Sign in with Google to view your board"}), 401
     try:
-        images = list_all_photos()
-        known_urls.update(images)
-        return jsonify(images)
+        return jsonify(list_board_photos(payload['sub']))
     except Exception as e:
         logger.error(f"Error listing images: {str(e)}")
         return jsonify([])
 
 
-# Rescan storage for photos added outside the upload API and notify clients
+# Pull in any photos found on disk but not yet attributed to a board (admin only)
 @app.route('/api/refresh-images', methods=['POST'])
 def refresh_images():
-    """Rescan local storage and notify clients of any photos not seen before."""
+    """Claim orphaned on-disk photos into the caller's board and notify it of the new arrivals."""
+    payload = verify_google_token(bearer_token())
+    if not payload:
+        return jsonify({"error": "Sign in with Google first"}), 401
+    if not is_admin(payload):
+        return jsonify({"error": "Only admins can rescan storage"}), 403
+
     try:
-        current = list_all_photos()
-        new_urls = [url for url in current if url not in known_urls]
-
+        board_id = payload['sub']
+        new_urls = claim_orphan_photos(board_id)
         if new_urls:
-            known_urls.update(new_urls)
-            socketio.emit('new_images', new_urls)
-
+            socketio.emit('new_images', new_urls, room=board_id)
         return jsonify({"status": "Checked for new images", "new_urls": new_urls})
-
     except Exception as e:
         logger.error(f"Error refreshing images: {str(e)}")
         return jsonify({"error": "Failed to refresh images"}), 500
 
 
+@socketio.on('join_board')
+def handle_join_board(data):
+    """A client proves board ownership with a Google ID token, then joins that board's room."""
+    payload = verify_google_token((data or {}).get('token'))
+    if payload:
+        join_room(payload['sub'])
+
+
+@socketio.on('leave_board')
+def handle_leave_board(data):
+    board_id = (data or {}).get('board')
+    if board_id:
+        leave_room(board_id)
+
+
 if __name__ == '__main__':
-    known_urls.update(list_all_photos())
-    logger.info(f"Loaded {len(known_urls)} existing photos from {PHOTOS_DIR}")
     logger.info("Starting the application server...")
     socketio.run(app, host=FLASK_HOST, port=FLASK_PORT, allow_unsafe_werkzeug=True)

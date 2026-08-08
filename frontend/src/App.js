@@ -83,13 +83,15 @@ function Photo({ url, index }) {
 function App() {
   const [images, setImages] = useState([]);
   const [freshUrls, setFreshUrls] = useState(() => new Set());
-  const [loading, setLoading] = useState(true);
+  const [imagesLoading, setImagesLoading] = useState(false);
+  const [configLoaded, setConfigLoaded] = useState(false);
   const [error, setError] = useState(null);
   const [connected, setConnected] = useState(false);
   const [config, setConfig] = useState({ title: 'Live Photo Collage' });
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [user, setUser] = useState(null);
   const [idToken, setIdToken] = useState(null);
+  const [signInError, setSignInError] = useState(null);
   const [downloadError, setDownloadError] = useState(null);
   const [downloading, setDownloading] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -102,36 +104,79 @@ function App() {
   const [usersError, setUsersError] = useState(null);
   const googleBtnRef = useRef(null);
   const gridRef = useRef(null);
+  const socketRef = useRef(null);
+  const idTokenRef = useRef(null);
+  const joinedBoardRef = useRef(null);
   const [gridBox, setGridBox] = useState({ width: 0, height: 0 });
 
-  const uploadUrl = `${window.location.origin}/upload`;
+  useEffect(() => {
+    idTokenRef.current = idToken;
+  }, [idToken]);
+
+  const loadImages = useCallback(async (token, boardId) => {
+    setImagesLoading(true);
+    try {
+      const response = await fetch('/api/images', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      setImages(data);
+      setError(null);
+      localStorage.setItem(`images_${boardId}`, JSON.stringify(data));
+    } catch (err) {
+      setError(err.message || 'Could not reach the server.');
+      const cached = JSON.parse(localStorage.getItem(`images_${boardId}`)) || [];
+      if (cached.length > 0) setImages(cached);
+    } finally {
+      setImagesLoading(false);
+    }
+  }, []);
+
+  const leaveCurrentBoard = () => {
+    if (joinedBoardRef.current && socketRef.current) {
+      socketRef.current.emit('leave_board', { board: joinedBoardRef.current });
+    }
+    joinedBoardRef.current = null;
+  };
 
   const handleCredentialResponse = useCallback(async (response) => {
     const profile = decodeGoogleCredential(response.credential);
     if (!profile) return;
 
-    setIdToken(response.credential);
+    const token = response.credential;
+    setSignInError(null);
     setDownloadError(null);
 
-    let phone = '';
-    let isAdmin = false;
     try {
       const res = await fetch('/api/profile', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${response.credential}` },
+        headers: { Authorization: `Bearer ${token}` },
       });
-      if (res.ok) {
-        const data = await res.json();
-        phone = data.phone || '';
-        isAdmin = !!data.isAdmin;
-      }
-    } catch (err) {
-      // profile recording is best-effort; sign-in still succeeds locally
-    }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
 
-    setUser({ name: profile.name, picture: profile.picture, email: profile.email, phone, isAdmin });
-    setPhoneInput(phone);
-  }, []);
+      leaveCurrentBoard();
+      setIdToken(token);
+      setUser({
+        name: profile.name,
+        picture: profile.picture,
+        email: profile.email,
+        phone: data.phone || '',
+        isAdmin: !!data.isAdmin,
+        boardId: data.boardId,
+      });
+      setPhoneInput(data.phone || '');
+
+      socketRef.current?.emit('join_board', { token });
+      joinedBoardRef.current = data.boardId;
+
+      loadImages(token, data.boardId);
+    } catch (err) {
+      setSignInError('Could not verify your sign-in with the server. Try again.');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadImages]);
 
   // Initialize Google Sign-In once the client ID and GIS script are available
   useEffect(() => {
@@ -145,7 +190,7 @@ function App() {
       });
       window.google.accounts.id.renderButton(googleBtnRef.current, {
         theme: 'filled_black',
-        size: 'medium',
+        size: 'large',
         shape: 'pill',
         text: 'signin',
       });
@@ -166,11 +211,15 @@ function App() {
 
   const signOut = () => {
     if (window.google) window.google.accounts.id.disableAutoSelect();
+    leaveCurrentBoard();
     setUser(null);
     setIdToken(null);
+    setImages([]);
+    setFreshUrls(new Set());
     setShowProfile(false);
     setShowUsers(false);
     setPhoneInput('');
+    setError(null);
   };
 
   const savePhone = async () => {
@@ -242,7 +291,7 @@ function App() {
   };
 
   const clearBoard = async () => {
-    if (!window.confirm('Delete every photo from the board? This cannot be undone.')) return;
+    if (!window.confirm('Delete every photo from your board? This cannot be undone.')) return;
     setClearing(true);
     setDownloadError(null);
     try {
@@ -256,7 +305,7 @@ function App() {
       }
       setImages([]);
       setFreshUrls(new Set());
-      localStorage.removeItem('images');
+      if (user) localStorage.removeItem(`images_${user.boardId}`);
     } catch (err) {
       setDownloadError(err.message || 'Could not clear the board. Try again.');
     } finally {
@@ -300,15 +349,17 @@ function App() {
     }
   };
 
-  // Socket connection for live updates
+  // Socket connection for live updates - joins no room until the user signs in
   useEffect(() => {
     const socket = io(window.location.origin, {
       transports: ['websocket', 'polling'],
     });
+    socketRef.current = socket;
 
     socket.on('connect', () => {
       setConnected(true);
       setError(null);
+      if (idTokenRef.current) socket.emit('join_board', { token: idTokenRef.current });
     });
 
     socket.on('disconnect', () => setConnected(false));
@@ -319,7 +370,9 @@ function App() {
       if (newImages && newImages.length > 0) {
         setImages((prev) => {
           const updated = [...prev, ...newImages];
-          localStorage.setItem('images', JSON.stringify(updated));
+          if (joinedBoardRef.current) {
+            localStorage.setItem(`images_${joinedBoardRef.current}`, JSON.stringify(updated));
+          }
           return updated;
         });
         markFresh(newImages);
@@ -329,34 +382,9 @@ function App() {
     socket.on('board_cleared', () => {
       setImages([]);
       setFreshUrls(new Set());
-      localStorage.removeItem('images');
     });
 
     return () => socket.disconnect();
-  }, []);
-
-  // Initial image fetch
-  useEffect(() => {
-    const fetchImages = async () => {
-      try {
-        const response = await fetch('/api/images');
-        if (response.ok) {
-          const data = await response.json();
-          setImages(data);
-          localStorage.setItem('images', JSON.stringify(data));
-        } else {
-          throw new Error(`HTTP ${response.status}`);
-        }
-      } catch (err) {
-        setError(err.message);
-        const cached = JSON.parse(localStorage.getItem('images')) || [];
-        if (cached.length > 0) setImages(cached);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchImages();
   }, []);
 
   // Config fetch
@@ -367,6 +395,8 @@ function App() {
         if (response.ok) setConfig(await response.json());
       } catch (err) {
         // keep default title
+      } finally {
+        setConfigLoaded(true);
       }
     };
     fetchConfig();
@@ -408,32 +438,41 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyPress);
   }, [isFullscreen]);
 
-  const refreshImages = async () => {
-    setLoading(true);
-    try {
-      const response = await fetch('/api/images');
-      if (response.ok) {
-        const data = await response.json();
-        setImages(data);
-        localStorage.setItem('images', JSON.stringify(data));
-        setError(null);
-      }
-    } catch (err) {
-      setError('Could not reach the server. Try again.');
-    } finally {
-      setLoading(false);
-    }
+  const refreshImages = () => {
+    if (!idToken || !user) return;
+    loadImages(idToken, user.boardId);
   };
 
-  if (loading) {
+  if (!configLoaded) {
     return (
       <div className="loading-screen">
         <ApertureIcon style={{ width: 44, height: 44 }} />
-        <h1>{config.title}</h1>
-        <span className="dot">loading photos&hellip;</span>
+        <span className="dot">loading&hellip;</span>
       </div>
     );
   }
+
+  if (!user) {
+    return (
+      <div className={`gate ${isFullscreen ? 'gate--fullscreen' : ''}`}>
+        <ApertureIcon style={{ width: 40, height: 40 }} />
+        <h1>{config.title}</h1>
+        {config.googleClientId ? (
+          <>
+            <p className="gate__copy">Sign in with Google to view your private board.</p>
+            <div ref={googleBtnRef} />
+            {signInError && <p className="gate__error">{signInError}</p>}
+          </>
+        ) : (
+          <p className="gate__error">
+            Google Sign-In isn't configured on this server yet. Ask the admin to set GOOGLE_CLIENT_ID.
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  const uploadUrl = `${window.location.origin}/upload?board=${user.boardId}`;
 
   return (
     <div className={`collage ${isFullscreen ? 'is-fullscreen' : ''}`}>
@@ -472,11 +511,11 @@ function App() {
 
           <div className="controls">
             <div className="controls__count">
-              <strong>{images.length}</strong> photo{images.length !== 1 ? 's' : ''} on the board
+              <strong>{images.length}</strong> photo{images.length !== 1 ? 's' : ''} on your board
             </div>
             <div className="controls__actions">
-              <button className="btn btn--primary" onClick={refreshImages} disabled={loading}>
-                {loading ? 'Checking…' : 'Refresh'}
+              <button className="btn btn--primary" onClick={refreshImages} disabled={imagesLoading}>
+                {imagesLoading ? 'Checking…' : 'Refresh'}
               </button>
               <button className="btn" onClick={enterBrowserFullscreen}>Fullscreen</button>
               <a
@@ -491,34 +530,26 @@ function App() {
             </div>
           </div>
 
-          {config.googleClientId && (
-            <div className="account-row">
-              {user ? (
-                <>
-                  <button className="account-row__identity" onClick={() => setShowProfile((v) => !v)}>
-                    <img className="account-row__avatar" src={user.picture} alt="" referrerPolicy="no-referrer" />
-                    <span className="account-row__name">{user.name}</span>
-                  </button>
-                  <button className="btn btn--primary" onClick={downloadAllPhotos} disabled={downloading}>
-                    {downloading ? 'Zipping…' : 'Download all photos'}
-                  </button>
-                  <button className="btn btn--danger" onClick={clearBoard} disabled={clearing || images.length === 0}>
-                    {clearing ? 'Clearing…' : 'Clear board'}
-                  </button>
-                  {user.isAdmin && (
-                    <button className="btn" onClick={toggleUsers}>
-                      {showUsers ? 'Hide users' : 'Manage users'}
-                    </button>
-                  )}
-                  <button className="btn btn--link" onClick={signOut}>Sign out</button>
-                </>
-              ) : (
-                <div ref={googleBtnRef} />
-              )}
-            </div>
-          )}
+          <div className="account-row">
+            <button className="account-row__identity" onClick={() => setShowProfile((v) => !v)}>
+              <img className="account-row__avatar" src={user.picture} alt="" referrerPolicy="no-referrer" />
+              <span className="account-row__name">{user.name}</span>
+            </button>
+            <button className="btn btn--primary" onClick={downloadAllPhotos} disabled={downloading}>
+              {downloading ? 'Zipping…' : 'Download all photos'}
+            </button>
+            <button className="btn btn--danger" onClick={clearBoard} disabled={clearing || images.length === 0}>
+              {clearing ? 'Clearing…' : 'Clear board'}
+            </button>
+            {user.isAdmin && (
+              <button className="btn" onClick={toggleUsers}>
+                {showUsers ? 'Hide users' : 'Manage users'}
+              </button>
+            )}
+            <button className="btn btn--link" onClick={signOut}>Sign out</button>
+          </div>
 
-          {user && showProfile && (
+          {showProfile && (
             <div className="profile-panel">
               <div className="profile-panel__row">
                 <img className="profile-panel__avatar" src={user.picture} alt="" referrerPolicy="no-referrer" />
@@ -548,7 +579,7 @@ function App() {
             </div>
           )}
 
-          {user && user.isAdmin && showUsers && (
+          {user.isAdmin && showUsers && (
             <div className="users-panel">
               {usersLoading ? (
                 <p className="users-panel__status">Loading users…</p>

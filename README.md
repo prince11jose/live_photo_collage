@@ -1,21 +1,22 @@
 # Live Photo Collage
 
-A real-time event photo wall. A shared screen shows a QR code; guests scan it, snap or pick a photo, and it appears on the board within seconds — no app, no login. Optionally, guests can sign in with Google to download every photo from the event as a zip.
+A multi-user private photo wall. Each person who signs in with Google gets their own board with a unique QR code; guests scan it and upload straight to that board with no app and no login of their own. Only the board's owner (and admins) can view, download, or clear its photos — no one's photos are visible to any other user.
 
 ## Architecture
 
 ### Backend (Flask, `backend/app.py`)
-- Flask + Socket.IO for real-time updates
-- Photos are stored on local disk, date-partitioned: `data/photos/YYYY-MM-DD/`
-- Upload endpoint for mobile photo submissions (auto-uploads on capture/select), capped at `UPLOAD_LIMIT_UNSIGNED` (default 15) photos until someone has signed in with Google at least once on this board
-- `/api/download-all` zips every photo, gated behind Google Sign-In (ID token verification)
-- `/api/profile` and `/api/admin/users` record signed-in users (email, name, picture, phone) in a SQLite database (`data/app.db`)
+- Flask + Socket.IO for real-time updates, one private Socket.IO room per board (`board_id` = the owner's Google `sub`)
+- Photos are stored on local disk, date-partitioned: `data/photos/YYYY-MM-DD/`; ownership of each photo is tracked in a SQLite `photos` table (`data/app.db`)
+- `POST /api/upload` accepts uploads with no login, but requires a valid `board` id (embedded in the QR code) naming an existing board to upload into
+- `/api/images`, `/api/download-all`, and `/api/clear-photos` all require Google Sign-In and only ever return/act on the caller's own board
+- `/api/profile` and `/api/admin/users` record signed-in users (email, name, picture, phone) in SQLite
 
 ### Frontend (React, `frontend/src/App.js`)
-- QR code for mobile upload access
-- Live updates via Socket.IO — new photos "develop" into view
-- Google Identity Services sign-in + "Download all photos" / "Clear board" / "Manage users" buttons (only shown once `GOOGLE_CLIENT_ID` is configured)
-- Profile panel to view/edit the signed-in user's phone number, and Sign Out
+- Sign in with Google to view your board — nothing is shown until you sign in
+- QR code (tied to your board) for guest mobile uploads
+- Live updates via Socket.IO, scoped to your board's room — new photos "develop" into view
+- "Download all photos" / "Clear board" buttons for your own board; "Manage users" for admins
+- Profile panel to view/edit your phone number, and Sign Out
 
 ## Local development
 
@@ -36,25 +37,25 @@ npm start                 # http://localhost:3000, proxies /api and /socket.io t
 
 ## API Endpoints
 
-- `GET /api/images` — current photo URLs
-- `POST /api/upload` — upload a photo (mobile); returns 403 past `UPLOAD_LIMIT_UNSIGNED` photos until someone has signed in with Google
-- `GET /upload` — mobile upload page
-- `POST /api/refresh-images` — rescan storage for photos added outside the API
-- `GET /api/download-all` — zip of every photo (requires `Authorization: Bearer <Google ID token>`)
-- `DELETE /api/clear-photos` — delete every photo (requires `Authorization: Bearer <Google ID token>`)
-- `POST /api/profile` — upsert the signed-in user's profile from their Google token, returns the stored record
+- `GET /api/images` — the signed-in user's own board photos (requires `Authorization: Bearer <Google ID token>`)
+- `POST /api/upload` — upload a photo (mobile, no login); requires a `board` form field naming an existing board
+- `GET /upload?board=<id>` — mobile upload page for a specific board (the QR code encodes this URL)
+- `POST /api/refresh-images` — admin-only: claim any photos found on disk but not yet attributed to a board
+- `GET /api/download-all` — zip of the caller's own board's photos (requires Google Sign-In)
+- `DELETE /api/clear-photos` — delete the caller's own board's photos (requires Google Sign-In)
+- `POST /api/profile` — upsert the signed-in user's profile/board from their Google token, returns the stored record (including `boardId`)
 - `PUT /api/profile` — update the signed-in user's phone number (JSON body: `{"phone": "..."}`)
-- `GET /api/admin/users` — list every recorded user profile (requires `Authorization: Bearer <Google ID token>` belonging to an email in `ADMIN_EMAILS`, returns 403 otherwise)
+- `GET /api/admin/users` — list every registered user/board (requires an email in `ADMIN_EMAILS`, returns 403 otherwise)
 - `GET /api/health`, `GET /api/config`, `GET /api/folder-info`
 
-## Google Sign-In (optional)
+## Google Sign-In (required)
 
-Sign-in is only shown once `GOOGLE_CLIENT_ID` is set. To enable it:
+Every board is owned by a Google account, so `GOOGLE_CLIENT_ID` must be set for the app to be usable at all:
 
 1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **OAuth 2.0 Client ID** of type **Web application**.
 2. Add your site's origin (e.g. `https://photowall.princejose.dev`) as an **Authorized JavaScript origin**.
 3. Set `GOOGLE_CLIENT_ID` in `backend/.env` (local) or the `photowall-config` ConfigMap (k8s) to that Client ID.
-4. Set `ADMIN_EMAILS` (comma-separated) to the email address(es) that should see the "Manage users" directory — everyone else can still sign in, download the zip, and clear the board, but won't see other guests' emails/phone numbers.
+4. Set `ADMIN_EMAILS` (comma-separated) to the email address(es) that should see the "Manage users" directory across all boards, and that inherit any pre-existing/legacy photos on first sign-in.
 
 ## Deploying to Kubernetes
 
