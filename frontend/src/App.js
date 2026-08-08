@@ -1,247 +1,412 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import QRCode from 'qrcode.react';
 import io from 'socket.io-client';
 import './App.css';
 
-// Custom component for handling Google Drive images with fallbacks
-function DriveImage({ url, index, style, onMouseOver, onMouseOut, onLoad }) {
-  const [currentUrl, setCurrentUrl] = useState(url);
-  const [loadAttempt, setLoadAttempt] = useState(0);
-  const [hasErrored, setHasErrored] = useState(false);
+const DEVELOP_MS = 2000;
+const TILE_GAP = 4;
 
-  // Helper function to get alternative Google Drive URL formats
-  const getGoogleDriveImageUrl = (originalUrl) => {
-    if (originalUrl.includes('drive.google.com/uc?export=view&id=')) {
-      const fileId = originalUrl.split('id=')[1];
-      return {
-        primary: originalUrl,
-        fallback1: `https://drive.google.com/thumbnail?id=${fileId}&sz=w400-h400`,
-        fallback2: `https://lh3.googleusercontent.com/d/${fileId}`,
-        fallback3: `https://drive.google.com/file/d/${fileId}/view`
-      };
+// Pick the rows/cols that fill a box of the given size with the largest possible
+// tiles and no leftover scroll, for a given tile count.
+function fitTilesToBox(count, width, height) {
+  if (count <= 0 || width <= 0 || height <= 0) return null;
+
+  let best = null;
+  for (let cols = 1; cols <= count; cols++) {
+    const rows = Math.ceil(count / cols);
+    const cellW = (width - (cols - 1) * TILE_GAP) / cols;
+    const cellH = (height - (rows - 1) * TILE_GAP) / rows;
+    if (cellW <= 0 || cellH <= 0) continue;
+    const area = cellW * cellH;
+    if (!best || area > best.area) {
+      best = { cols, rows, cellW, cellH, area };
     }
-    return { primary: originalUrl };
-  };
+  }
+  return best;
+}
 
-  const urlFormats = getGoogleDriveImageUrl(url);
-  const urlArray = Object.values(urlFormats);
-
-  const handleImageError = () => {
-    console.error(`Failed to load image (attempt ${loadAttempt + 1}): ${currentUrl}`);
-    setHasErrored(true);
-    
-    if (loadAttempt < urlArray.length - 1) {
-      const nextUrl = urlArray[loadAttempt + 1];
-      console.log(`Trying fallback URL: ${nextUrl}`);
-      setCurrentUrl(nextUrl);
-      setLoadAttempt(prev => prev + 1);
-    } else {
-      console.error(`All URL formats failed for image ${index + 1}`);
-    }
-  };
-
-  const handleImageLoad = (e) => {
-    console.log(`Successfully loaded image (attempt ${loadAttempt + 1}): ${currentUrl}`);
-    setHasErrored(false);
-    if (onLoad) onLoad(e);
-  };
-
+function ApertureIcon(props) {
   return (
-    <img
-      src={currentUrl}
-      alt={`Collage Photo ${index + 1}`}
-      referrerPolicy="no-referrer"
-      crossOrigin="anonymous"
-      style={style}
-      onError={handleImageError}
-      onLoad={handleImageLoad}
-      onMouseOver={onMouseOver}
-      onMouseOut={onMouseOut}
-      title={hasErrored ? 'Image failed to load' : `Photo ${index + 1}`}
-    />
+    <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <circle cx="24" cy="24" r="21" stroke="currentColor" strokeWidth="2" opacity="0.35" />
+      {[0, 60, 120, 180, 240, 300].map((deg) => (
+        <path
+          key={deg}
+          d="M24 24 L24 7 A17 17 0 0 1 37.7 15.5 Z"
+          fill="currentColor"
+          opacity="0.85"
+          transform={`rotate(${deg} 24 24)`}
+        />
+      ))}
+      <circle cx="24" cy="24" r="7" fill="none" stroke="currentColor" strokeWidth="2" />
+    </svg>
+  );
+}
+
+function CameraOutlineIcon(props) {
+  return (
+    <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <rect x="6" y="18" width="52" height="36" rx="6" stroke="currentColor" strokeWidth="2.5" />
+      <path d="M20 18l4-8h16l4 8" stroke="currentColor" strokeWidth="2.5" strokeLinejoin="round" />
+      <circle cx="32" cy="37" r="11" stroke="currentColor" strokeWidth="2.5" />
+      <circle cx="32" cy="37" r="4" fill="currentColor" />
+      <circle cx="49" cy="26" r="1.8" fill="currentColor" />
+    </svg>
+  );
+}
+
+function decodeGoogleCredential(token) {
+  try {
+    const payload = token.split('.')[1];
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+    return JSON.parse(decodeURIComponent(escape(json)));
+  } catch (err) {
+    return null;
+  }
+}
+
+function Photo({ url, index }) {
+  const [broken, setBroken] = useState(false);
+  return (
+    <div className="polaroid__frame">
+      <img
+        src={url}
+        alt={`#${index + 1}`}
+        loading="lazy"
+        style={broken ? { opacity: 0.25 } : undefined}
+        onError={() => setBroken(true)}
+      />
+    </div>
   );
 }
 
 function App() {
   const [images, setImages] = useState([]);
+  const [freshUrls, setFreshUrls] = useState(() => new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [connected, setConnected] = useState(false);
   const [config, setConfig] = useState({ title: 'Live Photo Collage' });
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [imageMetadata, setImageMetadata] = useState({});
+  const [user, setUser] = useState(null);
+  const [idToken, setIdToken] = useState(null);
+  const [downloadError, setDownloadError] = useState(null);
+  const [downloading, setDownloading] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
+  const [phoneInput, setPhoneInput] = useState('');
+  const [savingPhone, setSavingPhone] = useState(false);
+  const [showUsers, setShowUsers] = useState(false);
+  const [users, setUsers] = useState([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersError, setUsersError] = useState(null);
+  const googleBtnRef = useRef(null);
+  const gridRef = useRef(null);
+  const [gridBox, setGridBox] = useState({ width: 0, height: 0 });
 
-  const backendUrl = 'http://localhost:5000';
-  const uploadUrl = `${backendUrl}/upload`;
+  const uploadUrl = `${window.location.origin}/upload`;
 
-  console.log('App rendering...', { images: images.length, loading, error, connected });
+  const handleCredentialResponse = useCallback(async (response) => {
+    const profile = decodeGoogleCredential(response.credential);
+    if (!profile) return;
 
-  // Initialize socket connection
+    setIdToken(response.credential);
+    setDownloadError(null);
+
+    let phone = '';
+    try {
+      const res = await fetch('/api/profile', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${response.credential}` },
+      });
+      if (res.ok) phone = (await res.json()).phone || '';
+    } catch (err) {
+      // profile recording is best-effort; sign-in still succeeds locally
+    }
+
+    setUser({ name: profile.name, picture: profile.picture, email: profile.email, phone });
+    setPhoneInput(phone);
+  }, []);
+
+  // Initialize Google Sign-In once the client ID and GIS script are available
   useEffect(() => {
-    const socket = io(backendUrl, {
-      transports: ['websocket', 'polling']
+    if (!config.googleClientId || user) return;
+
+    const initGsi = () => {
+      if (!window.google || !googleBtnRef.current) return;
+      window.google.accounts.id.initialize({
+        client_id: config.googleClientId,
+        callback: handleCredentialResponse,
+      });
+      window.google.accounts.id.renderButton(googleBtnRef.current, {
+        theme: 'filled_black',
+        size: 'medium',
+        shape: 'pill',
+        text: 'signin',
+      });
+    };
+
+    if (window.google) {
+      initGsi();
+    } else {
+      const timer = setInterval(() => {
+        if (window.google) {
+          clearInterval(timer);
+          initGsi();
+        }
+      }, 300);
+      return () => clearInterval(timer);
+    }
+  }, [config.googleClientId, user, handleCredentialResponse]);
+
+  const signOut = () => {
+    if (window.google) window.google.accounts.id.disableAutoSelect();
+    setUser(null);
+    setIdToken(null);
+    setShowProfile(false);
+    setShowUsers(false);
+    setPhoneInput('');
+  };
+
+  const savePhone = async () => {
+    setSavingPhone(true);
+    try {
+      const response = await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ phone: phoneInput.trim() }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setUser((prev) => (prev ? { ...prev, phone: data.phone || '' } : prev));
+      }
+    } catch (err) {
+      // leave the input as-is so the user can retry
+    } finally {
+      setSavingPhone(false);
+    }
+  };
+
+  const loadUsers = async () => {
+    setUsersLoading(true);
+    setUsersError(null);
+    try {
+      const response = await fetch('/api/admin/users', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setUsers(await response.json());
+    } catch (err) {
+      setUsersError(err.message || 'Could not load users.');
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
+  const toggleUsers = () => {
+    const next = !showUsers;
+    setShowUsers(next);
+    if (next) loadUsers();
+  };
+
+  const downloadAllPhotos = async () => {
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      const response = await fetch('/api/download-all', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'live-photo-collage.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setDownloadError(err.message || 'Download failed. Try again.');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const clearBoard = async () => {
+    if (!window.confirm('Delete every photo from the board? This cannot be undone.')) return;
+    setClearing(true);
+    setDownloadError(null);
+    try {
+      const response = await fetch('/api/clear-photos', {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${response.status}`);
+      }
+      setImages([]);
+      setFreshUrls(new Set());
+      localStorage.removeItem('images');
+    } catch (err) {
+      setDownloadError(err.message || 'Could not clear the board. Try again.');
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const markFresh = (urls) => {
+    if (!urls || urls.length === 0) return;
+    setFreshUrls((prev) => {
+      const next = new Set(prev);
+      urls.forEach((u) => next.add(u));
+      return next;
+    });
+    setTimeout(() => {
+      setFreshUrls((prev) => {
+        const next = new Set(prev);
+        urls.forEach((u) => next.delete(u));
+        return next;
+      });
+    }, DEVELOP_MS);
+  };
+
+  const enterBrowserFullscreen = () => {
+    const fullscreenUrl = `${window.location.pathname}?fullscreen=true`;
+    const newWindow = window.open(fullscreenUrl, '_blank');
+
+    if (newWindow) {
+      newWindow.focus();
+      setTimeout(() => {
+        window.confirm(
+          'Fullscreen view opened in a new tab.\n\n' +
+          'Press F11 (or your browser\'s fullscreen option) to fill the screen.\n' +
+          'Tip: Ctrl+Shift+F does this from the main page too.'
+        );
+      }, 1000);
+    } else {
+      alert(
+        'Your browser blocked the popup. Open this link manually, then press F11:\n\n' + fullscreenUrl
+      );
+    }
+  };
+
+  // Socket connection for live updates
+  useEffect(() => {
+    const socket = io(window.location.origin, {
+      transports: ['websocket', 'polling'],
     });
 
     socket.on('connect', () => {
-      console.log('Socket connected');
       setConnected(true);
       setError(null);
     });
 
-    socket.on('disconnect', () => {
-      console.log('Socket disconnected');
-      setConnected(false);
-    });
+    socket.on('disconnect', () => setConnected(false));
 
-    socket.on('connect_error', (err) => {
-      console.error('Socket connection error:', err);
-      setError('Connection to server failed');
-    });
+    socket.on('connect_error', () => setError('Connection to server failed'));
 
     socket.on('new_images', (newImages) => {
-      console.log('New images received:', newImages);
       if (newImages && newImages.length > 0) {
-        setImages(prevImages => {
-          const updatedImages = [...prevImages, ...newImages];
-          localStorage.setItem('images', JSON.stringify(updatedImages));
-          return updatedImages;
+        setImages((prev) => {
+          const updated = [...prev, ...newImages];
+          localStorage.setItem('images', JSON.stringify(updated));
+          return updated;
         });
+        markFresh(newImages);
       }
     });
 
-    return () => {
-      socket.disconnect();
-    };
-  }, [backendUrl]);
+    socket.on('board_cleared', () => {
+      setImages([]);
+      setFreshUrls(new Set());
+      localStorage.removeItem('images');
+    });
 
-  // Fetch initial images
+    return () => socket.disconnect();
+  }, []);
+
+  // Initial image fetch
   useEffect(() => {
     const fetchImages = async () => {
       try {
-        console.log('Fetching images from backend...');
-        const response = await fetch(`${backendUrl}/api/images`);
-        
+        const response = await fetch('/api/images');
         if (response.ok) {
           const data = await response.json();
-          console.log('Fetched data:', data);
           setImages(data);
           localStorage.setItem('images', JSON.stringify(data));
         } else {
           throw new Error(`HTTP ${response.status}`);
         }
       } catch (err) {
-        console.error('Fetch error:', err);
         setError(err.message);
-        
-        // Fallback to cached images
-        const cachedImages = JSON.parse(localStorage.getItem('images')) || [];
-        if (cachedImages.length > 0) {
-          console.log('Using cached images:', cachedImages);
-          setImages(cachedImages);
-        }
+        const cached = JSON.parse(localStorage.getItem('images')) || [];
+        if (cached.length > 0) setImages(cached);
       } finally {
         setLoading(false);
       }
     };
 
     fetchImages();
-  }, [backendUrl]);
+  }, []);
 
-  // Fetch config
+  // Config fetch
   useEffect(() => {
     const fetchConfig = async () => {
       try {
-        const response = await fetch(`${backendUrl}/api/config`);
-        if (response.ok) {
-          const configData = await response.json();
-          setConfig(configData);
-        }
+        const response = await fetch('/api/config');
+        if (response.ok) setConfig(await response.json());
       } catch (err) {
-        console.error('Config fetch error:', err);
+        // keep default title
       }
     };
-
     fetchConfig();
-  }, [backendUrl]);
+  }, []);
 
-  // Check for fullscreen query parameter
+  // Fullscreen query param
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     setIsFullscreen(urlParams.get('fullscreen') === 'true');
   }, []);
 
-  // Helper function to handle image load and determine aspect ratio
-  const handleImageLoad = (url, index, imgElement) => {
-    const aspectRatio = imgElement.naturalWidth / imgElement.naturalHeight;
-    const orientation = aspectRatio > 1.2 ? 'landscape' : aspectRatio < 0.8 ? 'portrait' : 'square';
-    
-    setImageMetadata(prev => ({
-      ...prev,
-      [url]: {
-        aspectRatio,
-        orientation,
-        width: imgElement.naturalWidth,
-        height: imgElement.naturalHeight
-      }
-    }));
-  };
+  // Track the grid's available space so fullscreen mode can size tiles to fit
+  // every photo on one screen with no scrolling.
+  useEffect(() => {
+    if (!isFullscreen || !gridRef.current) return;
 
-  // Function to get dynamic grid item styles
-  const getImageContainerStyle = (url, index) => {
-    const metadata = imageMetadata[url];
-    if (!metadata) {
-      return { gridColumn: 'span 1', gridRow: 'span 1' };
-    }
-
-    const { orientation, aspectRatio } = metadata;
-    
-    if (isFullscreen) {
-      // In fullscreen mode, give more space to interesting aspect ratios
-      if (orientation === 'landscape' && aspectRatio > 1.5) {
-        return { gridColumn: 'span 2', gridRow: 'span 1' };
-      } else if (orientation === 'portrait' && aspectRatio < 0.6) {
-        return { gridColumn: 'span 1', gridRow: 'span 2' };
-      }
-    }
-    
-    return { gridColumn: 'span 1', gridRow: 'span 1' };
-  };
-
-  // Function to get dynamic image styles
-  const getImageStyle = (url) => {
-    const metadata = imageMetadata[url];
-    const baseStyle = {
-      width: '100%',
-      borderRadius: '12px',
-      transition: 'transform 0.3s ease, box-shadow 0.3s ease',
-      objectFit: 'cover'
+    const measure = () => {
+      const el = gridRef.current;
+      if (el) setGridBox({ width: el.clientWidth, height: el.clientHeight });
     };
 
-    if (!metadata) {
-      return { ...baseStyle, height: '250px' };
-    }
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(gridRef.current);
+    return () => observer.disconnect();
+  }, [isFullscreen, images.length]);
 
-    const { orientation, aspectRatio } = metadata;
-    
-    if (isFullscreen) {
-      // In fullscreen, let images show their natural proportions more
-      if (orientation === 'landscape') {
-        return { ...baseStyle, height: '200px', maxHeight: '300px' };
-      } else if (orientation === 'portrait') {
-        return { ...baseStyle, height: '300px', maxHeight: '500px' };
-      } else {
-        return { ...baseStyle, height: '250px' };
+  const tileLayout = isFullscreen ? fitTilesToBox(images.length, gridBox.width, gridBox.height) : null;
+
+  // Keyboard shortcut
+  useEffect(() => {
+    const handleKeyPress = (event) => {
+      if (!isFullscreen && ((event.ctrlKey && event.shiftKey && event.key === 'F') || event.key === 'F11')) {
+        event.preventDefault();
+        window.location.href = `${window.location.pathname}?fullscreen=true`;
       }
-    } else {
-      // Regular mode - more uniform sizing
-      return { ...baseStyle, height: '250px' };
-    }
-  };
+    };
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
+  }, [isFullscreen]);
 
   const refreshImages = async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${backendUrl}/api/images`);
+      const response = await fetch('/api/images');
       if (response.ok) {
         const data = await response.json();
         setImages(data);
@@ -249,8 +414,7 @@ function App() {
         setError(null);
       }
     } catch (err) {
-      console.error('Refresh error:', err);
-      setError('Failed to refresh images');
+      setError('Could not reach the server. Try again.');
     } finally {
       setLoading(false);
     }
@@ -258,265 +422,218 @@ function App() {
 
   if (loading) {
     return (
-      <div className="collage" style={{padding: '20px', textAlign: 'center'}}>
-        <h1>📸 {config.title}</h1>
-        <div style={{color: '#666', fontSize: '18px'}}>Loading images...</div>
+      <div className="loading-screen">
+        <ApertureIcon style={{ width: 44, height: 44 }} />
+        <h1>{config.title}</h1>
+        <span className="dot">loading photos&hellip;</span>
       </div>
     );
   }
 
   return (
-    <div className="collage" style={{
-      padding: isFullscreen ? '10px' : '20px', 
-      maxWidth: isFullscreen ? '100vw' : '1200px', 
-      margin: '0 auto',
-      minHeight: isFullscreen ? '100vh' : 'auto'
-    }}>
+    <div className={`collage ${isFullscreen ? 'is-fullscreen' : ''}`}>
       {!isFullscreen && (
         <>
-          <div className="header" style={{textAlign: 'center', marginBottom: '30px'}}>
-            <h1 style={{color: '#333', marginBottom: '20px'}}>📸 {config.title}</h1>
-            
-            {/* Connection Status */}
-            <div style={{
-              display: 'inline-block',
-              padding: '5px 10px',
-              borderRadius: '15px',
-              fontSize: '12px',
-              marginBottom: '15px',
-              background: connected ? '#d4edda' : '#f8d7da',
-              color: connected ? '#155724' : '#721c24'
-            }}>
-              {connected ? '🟢 Connected' : '🔴 Disconnected'}
+          <header className="marquee">
+            <div className="marquee__brand">
+              <ApertureIcon />
+              <h1 className="marquee__title">{config.title}</h1>
             </div>
+            <div className="marquee__status">
+              <span className={`dot ${connected ? 'is-live' : ''}`} />
+              {connected ? 'Live' : 'Reconnecting'}
+            </div>
+          </header>
 
-            {error && (
-              <div style={{
-                color: '#721c24',
-                background: '#f8d7da',
-                padding: '10px',
-                borderRadius: '5px',
-                marginBottom: '15px',
-                border: '1px solid #f5c6cb'
-              }}>
-                ⚠️ {error}
-                <button 
-                  onClick={refreshImages}
-                  style={{
-                    background: '#17a2b8',
-                    color: 'white',
-                    border: 'none',
-                    padding: '5px 10px',
-                    borderRadius: '3px',
-                    cursor: 'pointer',
-                    marginLeft: '10px',
-                    fontSize: '12px'
-                  }}
-                >
-                  🔄 Retry
-                </button>
-              </div>
-            )}
-            
-            {/* QR Code Section */}
-            <div style={{
-              margin: '20px auto',
-              padding: '20px',
-              background: 'white',
-              borderRadius: '12px',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-              maxWidth: '500px'
-            }}>
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '25px',
-                flexWrap: 'wrap'
-              }}>
-                <QRCode 
-                  value={uploadUrl} 
-                  size={150}
-                  level="M"
-                  includeMargin={true}
-                />
-                <div style={{textAlign: 'left'}}>
-                  <p style={{margin: 0, fontWeight: 'bold', fontSize: '16px', color: '#007bff'}}>
-                    📱 Scan to Upload Photos
-                  </p>
-                  <p style={{margin: '8px 0 0 0', fontSize: '14px', color: '#666', lineHeight: '1.4'}}>
-                    Use your phone camera to scan this QR code and start uploading photos to the collage
-                  </p>
+          <div className="ticket">
+            <div className="ticket__stub">
+              <QRCode value={uploadUrl} size={128} level="M" includeMargin={false} />
+            </div>
+            <div className="ticket__body">
+              <span className="ticket__eyebrow">Admit one &middot; no app required</span>
+              <h2 className="ticket__headline">Add your shot</h2>
+              <p className="ticket__copy">
+                Scan with your phone's camera. Your photo develops right on this board, live.
+              </p>
+            </div>
+          </div>
+
+          {error && (
+            <div className="banner">
+              <p>{error}</p>
+              <button className="btn" onClick={refreshImages}>Retry</button>
+            </div>
+          )}
+
+          <div className="controls">
+            <div className="controls__count">
+              <strong>{images.length}</strong> photo{images.length !== 1 ? 's' : ''} on the board
+            </div>
+            <div className="controls__actions">
+              <button className="btn btn--primary" onClick={refreshImages} disabled={loading}>
+                {loading ? 'Checking…' : 'Refresh'}
+              </button>
+              <button className="btn" onClick={enterBrowserFullscreen}>Fullscreen</button>
+              <a
+                className="btn btn--link"
+                href={`${window.location.pathname}?fullscreen=true`}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open fullscreen view in a new tab (then press F11)"
+              >
+                direct link
+              </a>
+            </div>
+          </div>
+
+          {config.googleClientId && (
+            <div className="account-row">
+              {user ? (
+                <>
+                  <button className="account-row__identity" onClick={() => setShowProfile((v) => !v)}>
+                    <img className="account-row__avatar" src={user.picture} alt="" referrerPolicy="no-referrer" />
+                    <span className="account-row__name">{user.name}</span>
+                  </button>
+                  <button className="btn btn--primary" onClick={downloadAllPhotos} disabled={downloading}>
+                    {downloading ? 'Zipping…' : 'Download all photos'}
+                  </button>
+                  <button className="btn btn--danger" onClick={clearBoard} disabled={clearing || images.length === 0}>
+                    {clearing ? 'Clearing…' : 'Clear board'}
+                  </button>
+                  <button className="btn" onClick={toggleUsers}>
+                    {showUsers ? 'Hide users' : 'Manage users'}
+                  </button>
+                  <button className="btn btn--link" onClick={signOut}>Sign out</button>
+                </>
+              ) : (
+                <div ref={googleBtnRef} />
+              )}
+            </div>
+          )}
+
+          {user && showProfile && (
+            <div className="profile-panel">
+              <div className="profile-panel__row">
+                <img className="profile-panel__avatar" src={user.picture} alt="" referrerPolicy="no-referrer" />
+                <div>
+                  <div className="profile-panel__name">{user.name}</div>
+                  <div className="profile-panel__email">{user.email}</div>
                 </div>
               </div>
+              <label className="profile-panel__field">
+                <span>Phone number</span>
+                <div className="profile-panel__phone-row">
+                  <input
+                    type="tel"
+                    value={phoneInput}
+                    onChange={(e) => setPhoneInput(e.target.value)}
+                    placeholder="Add a phone number"
+                  />
+                  <button
+                    className="btn btn--primary"
+                    onClick={savePhone}
+                    disabled={savingPhone || phoneInput.trim() === (user.phone || '')}
+                  >
+                    {savingPhone ? 'Saving…' : 'Save'}
+                  </button>
+                </div>
+              </label>
             </div>
-          </div>
+          )}
 
-          {/* Stats and Controls */}
-          <div style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            background: 'rgba(255, 255, 255, 0.9)',
-            padding: '15px 20px',
-            borderRadius: '10px',
-            marginBottom: '20px',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.1)'
-          }}>
-            <div style={{color: '#333', fontSize: '16px', fontWeight: '500'}}>
-              {images.length} photo{images.length !== 1 ? 's' : ''} in collage
+          {user && showUsers && (
+            <div className="users-panel">
+              {usersLoading ? (
+                <p className="users-panel__status">Loading users…</p>
+              ) : usersError ? (
+                <p className="users-panel__status">{usersError}</p>
+              ) : users.length === 0 ? (
+                <p className="users-panel__status">No one has signed in yet.</p>
+              ) : (
+                <table className="users-panel__table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Email</th>
+                      <th>Phone</th>
+                      <th>Last seen</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {users.map((u) => (
+                      <tr key={u.email}>
+                        <td>{u.name}</td>
+                        <td>{u.email}</td>
+                        <td>{u.phone || '—'}</td>
+                        <td>{new Date(u.lastSeen).toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </div>
-            <div style={{display: 'flex', gap: '10px'}}>
-              <button 
-                onClick={refreshImages}
-                disabled={loading}
-                style={{
-                  background: loading ? '#6c757d' : '#28a745',
-                  color: 'white',
-                  border: 'none',
-                  padding: '8px 16px',
-                  borderRadius: '6px',
-                  cursor: loading ? 'not-allowed' : 'pointer',
-                  fontSize: '14px',
-                  transition: 'background 0.3s ease'
-                }}
-              >
-                {loading ? '⏳ Loading...' : '🔄 Refresh'}
-              </button>
-              <button 
-                onClick={() => window.open(`${window.location.pathname}?fullscreen=true`, '_blank')}
-                style={{
-                  background: '#007bff',
-                  color: 'white',
-                  border: 'none',
-                  padding: '8px 16px',
-                  borderRadius: '6px',
-                  cursor: 'pointer',
-                  fontSize: '14px'
-                }}
-              >
-                📺 Fullscreen
-              </button>
+          )}
+
+          {downloadError && (
+            <div className="banner">
+              <p>{downloadError}</p>
             </div>
-          </div>
+          )}
+
+          <div className="hint">Ctrl+Shift+F for fullscreen</div>
         </>
       )}
 
       {isFullscreen && (
-        <div style={{textAlign: 'center', marginBottom: '20px', position: 'relative'}}>
-          <h1 style={{color: '#333', fontSize: '2.5rem', margin: '10px 0'}}>{config.title}</h1>
-          <button 
-            onClick={() => window.location.href = window.location.pathname}
-            style={{
-              background: '#007bff',
-              color: 'white',
-              border: 'none',
-              padding: '8px 16px',
-              borderRadius: '6px',
-              cursor: 'pointer',
-              fontSize: '14px',
-              position: 'absolute',
-              top: '10px',
-              right: '10px'
-            }}
-          >
-            Exit Fullscreen
-          </button>
+        <div className="fs-title">
+          <h1>{config.title}</h1>
         </div>
       )}
 
-      {/* Image Grid */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: isFullscreen 
-          ? 'repeat(auto-fill, minmax(300px, 1fr))' 
-          : 'repeat(auto-fill, minmax(250px, 1fr))',
-        gap: isFullscreen ? '15px' : '20px',
-        gridAutoRows: 'min-content'
-      }}>
-        {images.length > 0 ? (
-          images.map((url, index) => (
-            <div 
-              key={index} 
-              style={{
-                position: 'relative',
-                overflow: 'hidden',
-                borderRadius: '12px',
-                boxShadow: '0 6px 20px rgba(0,0,0,0.15)',
-                transition: 'transform 0.3s ease',
-                ...getImageContainerStyle(url, index)
-              }}
-            >
-              <DriveImage
-                url={url}
-                index={index}
-                style={getImageStyle(url)}
-                onMouseOver={(e) => {
-                  e.target.style.transform = 'scale(1.05)';
-                  e.target.parentElement.style.transform = 'translateY(-5px)';
-                }}
-                onMouseOut={(e) => {
-                  e.target.style.transform = 'scale(1)';
-                  e.target.parentElement.style.transform = 'translateY(0)';
-                }}
-                onLoad={(e) => handleImageLoad(url, index, e.target)}
-              />
-              <div style={{
-                position: 'absolute',
-                top: '10px',
-                right: '10px',
-                background: 'rgba(0,0,0,0.7)',
-                color: 'white',
-                padding: '6px 10px',
-                borderRadius: '15px',
-                fontSize: '12px',
-                fontWeight: 'bold'
-              }}>
-                #{index + 1}
+      <div className="board">
+        <div
+          className="board__grid"
+          ref={gridRef}
+          style={
+            tileLayout
+              ? {
+                  gridTemplateColumns: `repeat(${tileLayout.cols}, ${tileLayout.cellW}px)`,
+                  gridAutoRows: `${tileLayout.cellH}px`,
+                  gap: `${TILE_GAP}px`,
+                }
+              : undefined
+          }
+        >
+          {images.length > 0 ? (
+            images.map((url, index) => (
+              <div key={url + index} className={`polaroid ${freshUrls.has(url) ? 'is-developing' : ''}`}>
+                {!isFullscreen && (
+                  <>
+                    <span className="polaroid__pin" />
+                    <span className="image-index">#{index + 1}</span>
+                    <div className="polaroid__caption">{`shot ${index + 1}`}</div>
+                  </>
+                )}
+                <Photo url={url} index={index} />
               </div>
-            </div>
-          ))
-        ) : (
-          <div style={{
-            gridColumn: '1 / -1',
-            textAlign: 'center',
-            padding: isFullscreen ? '40px 20px' : '60px 20px',
-            background: 'rgba(255, 255, 255, 0.9)',
-            borderRadius: '15px',
-            boxShadow: '0 6px 20px rgba(0,0,0,0.1)'
-          }}>
-            <div style={{fontSize: '48px', marginBottom: '20px'}}>📱</div>
-            <h3 style={{color: '#333', marginBottom: '10px'}}>No photos yet!</h3>
-            {!isFullscreen && (
-              <>
-                <p style={{color: '#666', marginBottom: '20px', fontSize: '16px'}}>
-                  Scan the QR code above with your phone to start uploading photos to the collage.
-                  Photos will appear here in real-time!
-                </p>
-                <button 
-                  onClick={refreshImages}
-                  style={{
-                    background: '#007bff',
-                    color: 'white',
-                    border: 'none',
-                    padding: '12px 24px',
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    fontSize: '14px',
-                    fontWeight: '500'
-                  }}
-                >
-                  🔄 Check for Photos
-                </button>
-              </>
-            )}
-            {isFullscreen && (
-              <p style={{color: '#666', fontSize: '18px'}}>
-                Photos will appear here as they are uploaded
+            ))
+          ) : (
+            <div className="board__empty">
+              <CameraOutlineIcon className="board__empty-icon" />
+              <h3>{isFullscreen ? "Nothing's up yet" : 'Waiting for the first shot'}</h3>
+              <p>
+                {isFullscreen
+                  ? 'Photos appear here the moment someone uploads.'
+                  : "Scan the code above with your phone. Your photo shows up here in seconds — no app, no login."}
               </p>
-            )}
-          </div>
-        )}
+              {!isFullscreen && (
+                <div className="controls__actions">
+                  <button className="btn btn--primary" onClick={refreshImages}>Check again</button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

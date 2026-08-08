@@ -505,3 +505,11 @@ vite.config.ts.timestamp-*
 
 backend/client_secrets.json
 backend/token.json
+
+# Runtime data: uploaded photos and the SQLite user-profile DB (contains real emails/phone numbers)
+backend/data/
+
+# Local dev script PID tracking
+.pids
+.backend_pid
+.frontend_pid

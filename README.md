@@ -1,195 +1,78 @@
 # Live Photo Collage
 
-A real-time photo collage application that automatically displays photos uploaded to Google Drive, featuring QR code integration for easy mobile photo uploads.
-
-## Features
-
-- 📸 **Real-time Photo Collage**: Displays photos from Google Drive in a responsive grid layout
-- 📱 **QR Code Upload**: Scan QR code with mobile device to access upload interface
-- 🔄 **Live Updates**: New photos appear instantly using WebSocket connections
-- 📱 **Mobile Optimized**: Mobile-friendly upload interface with camera integration
-- ☁️ **Google Drive Integration**: Direct upload to Google Drive with OAuth authentication
-- 📁 **Organized Storage**: Automatic folder structure: `live_photo_collage/YYYY-MM-DD/`
+A real-time event photo wall. A shared screen shows a QR code; guests scan it, snap or pick a photo, and it appears on the board within seconds — no app, no login. Optionally, guests can sign in with Google to download every photo from the event as a zip.
 
 ## Architecture
 
-### Backend (Flask)
-- Flask server with Socket.IO for real-time updates
-- Google Drive API integration for file operations
-- OAuth2 authentication for secure access
-- Upload endpoint for mobile photo submissions
-- Image proxy for serving Google Drive content
+### Backend (Flask, `backend/app.py`)
+- Flask + Socket.IO for real-time updates
+- Photos are stored on local disk, date-partitioned: `data/photos/YYYY-MM-DD/`
+- Upload endpoint for mobile photo submissions (auto-uploads on capture/select)
+- `/api/download-all` zips every photo, gated behind Google Sign-In (ID token verification)
+- `/api/profile` and `/api/admin/users` record signed-in users (email, name, picture, phone) in a SQLite database (`data/app.db`)
 
-### Frontend (React)
-- React application with responsive design
-- QR code generation for mobile access
-- Real-time updates via Socket.IO
-- CSS Grid layout that auto-adjusts as photos are added
+### Frontend (React, `frontend/src/App.js`)
+- QR code for mobile upload access
+- Live updates via Socket.IO — new photos "develop" into view
+- Google Identity Services sign-in + "Download all photos" / "Clear board" / "Manage users" buttons (only shown once `GOOGLE_CLIENT_ID` is configured)
+- Profile panel to view/edit the signed-in user's phone number, and Sign Out
 
-## Setup Instructions
+## Local development
 
-### Prerequisites
-- Python 3.8+ 
-- Node.js 14+
-- Google Cloud Project with Drive API enabled
-- Google OAuth2 credentials
-
-### Backend Setup
-
-1. **Navigate to backend directory**:
-   ```bash
-   cd backend
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Configure Google Drive API**:
-   - Create a Google Cloud Project
-   - Enable Google Drive API and Google Drive Activity API
-   - Create OAuth2 credentials (Desktop application)
-   - Download credentials as `client_secrets.json` and place in backend directory
-
-4. **Configure environment**:
-   - Update `.env` file with your Google Drive folder ID
-   - The folder ID can be found in the Google Drive URL when viewing the folder
-
-5. **Start the backend**:
-   ```bash
-   python app.py
-   ```
-
-### Frontend Setup
-
-1. **Navigate to frontend directory**:
-   ```bash
-   cd frontend
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   npm install
-   ```
-
-3. **Start the frontend**:
-   ```bash
-   npm start
-   ```
-
-### First Time Setup
-
-1. **Authentication**: When you first run the backend, it will open a browser window for Google OAuth authentication
-2. **Folder Access**: Ensure the Google account has access to the specified Drive folder
-3. **Testing**: Upload a test photo to verify the integration works
-
-## Usage
-
-1. **Start both backend and frontend servers**
-2. **Open the frontend in a browser** (usually http://localhost:3000)
-3. **Scan the QR code** with a mobile device
-4. **Take or select photos** on the mobile upload page
-5. **Watch photos appear** in real-time on the collage
-
-## Mobile Upload Flow
-
-1. **QR Code**: Main screen displays QR code
-2. **Mobile Access**: Scan QR code to open upload interface
-3. **Photo Capture**: Use camera or select from gallery
-4. **Upload**: Photo uploads directly to Google Drive
-5. **Live Update**: Photo appears on collage immediately
-
-## Configuration
-
-### Environment Variables (Backend)
-
-- `UPLOAD_FOLDER_ID`: Google Drive folder ID for uploads
-- `FLASK_HOST`: Server host (default: 0.0.0.0)
-- `FLASK_PORT`: Server port (default: 5000)
-
-### Google Drive Setup
-
-The application automatically creates an organized folder structure in your Google Drive:
-
-```
-📁 Google Drive Root
-└── 📁 live_photo_collage/
-    └── 📁 2025-08-23/          (Today's date)
-        ├── 📷 photo_001.jpg
-        ├── 📷 photo_002.jpg
-        └── 📷 ...
+**Backend**
+```bash
+cd backend
+python -m venv ../.venv && source ../.venv/bin/activate
+pip install -r requirements.txt
+python app.py            # http://localhost:5000
 ```
 
-**First Time Setup:**
-1. The app will automatically create the `live_photo_collage` main folder
-2. A new date folder (YYYY-MM-DD) is created each day
-3. All photos uploaded on a specific date go into that day's folder
-4. The `.env` file is automatically updated with the current folder ID
-
-**Manual Configuration (Optional):**
-1. Create your own folder structure in Google Drive
-2. Copy the folder ID from the URL: `https://drive.google.com/drive/folders/FOLDER_ID_HERE`
-3. Update the `UPLOAD_FOLDER_ID` in `.env`
+**Frontend**
+```bash
+cd frontend
+npm install
+npm start                 # http://localhost:3000, proxies /api and /socket.io to :5000
+```
 
 ## API Endpoints
 
-- `GET /api/images`: Fetch current image list
-- `POST /api/upload`: Upload new photo (mobile)
-- `GET /upload`: Mobile upload interface
-- `POST /api/refresh-images`: Manually refresh image list
+- `GET /api/images` — current photo URLs
+- `POST /api/upload` — upload a photo (mobile)
+- `GET /upload` — mobile upload page
+- `POST /api/refresh-images` — rescan storage for photos added outside the API
+- `GET /api/download-all` — zip of every photo (requires `Authorization: Bearer <Google ID token>`)
+- `DELETE /api/clear-photos` — delete every photo (requires `Authorization: Bearer <Google ID token>`)
+- `POST /api/profile` — upsert the signed-in user's profile from their Google token, returns the stored record
+- `PUT /api/profile` — update the signed-in user's phone number (JSON body: `{"phone": "..."}`)
+- `GET /api/admin/users` — list every recorded user profile (requires `Authorization: Bearer <Google ID token>`)
+- `GET /api/health`, `GET /api/config`, `GET /api/folder-info`
 
-## Technical Details
+## Google Sign-In (optional)
 
-### Real-time Updates
-- Uses Socket.IO for bidirectional communication
-- Backend monitors Google Drive activity
-- New uploads trigger immediate frontend updates
+Sign-in is only shown once `GOOGLE_CLIENT_ID` is set. To enable it:
 
-### Image Handling
-- Images served via proxy to avoid CORS issues
-- Lazy loading for performance
-- Responsive grid layout with CSS Grid
-- Fallback images for failed loads
+1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **OAuth 2.0 Client ID** of type **Web application**.
+2. Add your site's origin (e.g. `https://photowall.princejose.dev`) as an **Authorized JavaScript origin**.
+3. Set `GOOGLE_CLIENT_ID` in `backend/.env` (local) or the `photowall-config` ConfigMap (k8s) to that Client ID.
 
-### Security
-- OAuth2 authentication with Google
-- CORS configuration for cross-origin requests
-- Secure file upload with validation
+## Deploying to Kubernetes
 
-## Troubleshooting
+Manifests live in `k8s/`: namespace, ConfigMap, backend (Deployment + Service + PVC for `/data/photos`), and frontend (Deployment + NodePort Service; nginx serves the React build and reverse-proxies `/api`, `/upload`, `/photos`, `/socket.io` to the backend Service).
 
-### Common Issues
+```bash
+docker build -t photowall-backend:latest ./backend
+docker build -t photowall-frontend:latest ./frontend
 
-1. **Authentication Errors**: 
-   - Ensure `client_secrets.json` is present
-   - Check Google Cloud Console API permissions
-   - Verify OAuth2 credentials are for "Desktop application"
+# microk8s uses its own containerd, not the host Docker daemon
+docker save photowall-backend:latest  | microk8s ctr image import -
+docker save photowall-frontend:latest | microk8s ctr image import -
 
-2. **Upload Failures**:
-   - Check folder permissions in Google Drive
-   - Verify folder ID in configuration
-   - Ensure Drive API quota isn't exceeded
+microk8s kubectl apply -f k8s/namespace.yaml
+microk8s kubectl apply -f k8s/configmap.yaml -f k8s/backend.yaml -f k8s/frontend.yaml
+```
 
-3. **Images Not Loading**:
-   - Check Google Drive folder accessibility
-   - Verify image proxy endpoint
-   - Check browser console for CORS errors
-
-### Development
-
-- **Backend logs**: Check terminal running Flask app
-- **Frontend logs**: Check browser developer console
-- **Network issues**: Verify ports 3000 and 5000 are available
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+The frontend Service is exposed on NodePort `30105`. Point any reverse proxy / tunnel (e.g. Cloudflare Tunnel) at `http://localhost:30105`.
 
 ## License
 
-This project is open source and available under the MIT License.
+MIT.
