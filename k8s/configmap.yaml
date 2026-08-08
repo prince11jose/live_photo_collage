@@ -13,4 +13,4 @@ data:
   GOOGLE_CLIENT_ID: "520360783242-nhtep74ugo25vuaq69i2lktg06v2vi60.apps.googleusercontent.com"
   # Comma-separated emails allowed to see the "Manage users" directory across all boards,
   # and that inherit any pre-existing/legacy photos on first sign-in.
-  ADMIN_EMAILS: "prince@movingwalls.com"
+  ADMIN_EMAILS: "prince@movingwalls.com,prince11jose@gmail.com"
