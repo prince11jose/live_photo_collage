@@ -85,6 +85,7 @@ function App() {
   const [freshUrls, setFreshUrls] = useState(() => new Set());
   const [imagesLoading, setImagesLoading] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [restoringSession, setRestoringSession] = useState(() => !!localStorage.getItem('idToken'));
   const [error, setError] = useState(null);
   const [connected, setConnected] = useState(false);
   const [config, setConfig] = useState({ title: 'Live Photo Collage' });
@@ -140,13 +141,12 @@ function App() {
     joinedBoardRef.current = null;
   };
 
-  const handleCredentialResponse = useCallback(async (response) => {
-    const profile = decodeGoogleCredential(response.credential);
-    if (!profile) return;
-
-    const token = response.credential;
-    setSignInError(null);
-    setDownloadError(null);
+  const signInWithToken = useCallback(async (token, { silent } = {}) => {
+    const profile = decodeGoogleCredential(token);
+    if (!profile) {
+      if (silent) localStorage.removeItem('idToken');
+      return;
+    }
 
     try {
       const res = await fetch('/api/profile', {
@@ -157,6 +157,7 @@ function App() {
       const data = await res.json();
 
       leaveCurrentBoard();
+      localStorage.setItem('idToken', token);
       setIdToken(token);
       setUser({
         name: profile.name,
@@ -167,16 +168,35 @@ function App() {
         boardId: data.boardId,
       });
       setPhoneInput(data.phone || '');
+      setSignInError(null);
+      setDownloadError(null);
 
       socketRef.current?.emit('join_board', { token });
       joinedBoardRef.current = data.boardId;
 
       loadImages(token, data.boardId);
     } catch (err) {
-      setSignInError('Could not verify your sign-in with the server. Try again.');
+      if (silent) {
+        // Stored session is stale (expired/revoked) - fall back to the sign-in button quietly.
+        localStorage.removeItem('idToken');
+      } else {
+        setSignInError('Could not verify your sign-in with the server. Try again.');
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadImages]);
+
+  const handleCredentialResponse = useCallback((response) => {
+    signInWithToken(response.credential);
+  }, [signInWithToken]);
+
+  // Restore a previous sign-in (e.g. after opening the fullscreen view in a new
+  // tab) from the token saved on the last successful sign-in.
+  useEffect(() => {
+    const stored = localStorage.getItem('idToken');
+    if (!stored) return;
+    signInWithToken(stored, { silent: true }).finally(() => setRestoringSession(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Initialize Google Sign-In once the client ID and GIS script are available
   useEffect(() => {
@@ -212,6 +232,7 @@ function App() {
   const signOut = () => {
     if (window.google) window.google.accounts.id.disableAutoSelect();
     leaveCurrentBoard();
+    localStorage.removeItem('idToken');
     setUser(null);
     setIdToken(null);
     setImages([]);
@@ -443,7 +464,7 @@ function App() {
     loadImages(idToken, user.boardId);
   };
 
-  if (!configLoaded) {
+  if (!configLoaded || restoringSession) {
     return (
       <div className="loading-screen">
         <ApertureIcon style={{ width: 44, height: 44 }} />
